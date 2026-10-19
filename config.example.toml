@@ -25,9 +25,12 @@ timezone = "auto"
 utc_offset_sec = 19800
 
 [schedule]
-# Minutes between fetches. Overnight the temperature moves a couple of degrees
-# and nobody is looking at the panel, so night can be slow.
-day_interval_min = 20
+# Minutes between fetches. A gap of 15 minutes or more is rounded up to a whole
+# number of Open-Meteo's 900 s model steps, so a fetch never re-reads an
+# observation the panel already shows; below that the number is taken exactly,
+# which is what a bench test wants. Overnight the temperature moves a couple of
+# degrees and nobody is looking at the panel, so night can be slow.
+day_interval_min = 30
 night_interval_min = 120
 
 # Minutes before a failed fetch is retried.

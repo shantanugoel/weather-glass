@@ -46,8 +46,12 @@ menu "Weather Glass"
 
     config GLASS_DAY_INTERVAL_MIN
         int "Minutes between fetches while the sun is up"
-        default 20
+        default 30
         range 1 1440
+        help
+            A gap of 15 minutes or more is rounded up to a whole number of
+            Open-Meteo's 900 s model steps, so every fetch sees an observation
+            that could have changed. Set in config.toml, not here.
 
     config GLASS_NIGHT_INTERVAL_MIN
         int "Minutes between fetches while the sun is down"

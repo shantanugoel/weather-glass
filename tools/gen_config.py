@@ -21,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TOML = ROOT / "config.toml"
 DEFAULT_OUT = ROOT / "firmware" / "sdkconfig.defaults.local"
+DEFAULT_SDKCONFIG = ROOT / "firmware" / "sdkconfig"
 
 # key -> (toml path, kconfig name, type, validator)
 def _range(lo: float, hi: float):
@@ -116,6 +117,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--check", action="store_true", help="validate only")
     ap.add_argument("--print", action="store_true", dest="print_only")
+    ap.add_argument("--sdkconfig", type=Path, default=DEFAULT_SDKCONFIG,
+                    help="generated sdkconfig to invalidate when the fragment changes")
     a = ap.parse_args()
 
     cfg = load(a.toml)
@@ -145,6 +148,28 @@ def main() -> None:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(text)
     print(f"{a.out.relative_to(ROOT)}: written from {a.toml.name}")
+    invalidate_sdkconfig(a.sdkconfig)
+
+
+def invalidate_sdkconfig(path: Path) -> None:
+    """Drop a generated sdkconfig so the new fragment actually reaches the build.
+
+    Kconfig applies sdkconfig.defaults* only to symbols that are *absent* from
+    firmware/sdkconfig, so editing config.toml alone never changes anything a
+    previous build already settled: a bench-test day_interval_min of 1 kept
+    winning against a config.toml that said 20, and the panel refreshed once a
+    minute while the TOML looked correct. sdkconfig is generated and gitignored
+    (everything worth configuring lives in config.toml), so the honest fix for
+    a changed fragment is to delete it and let the next configure reseed it.
+    """
+    for stale in (path, path.with_name(path.name + ".old")):
+        if stale.exists():
+            stale.unlink()
+            try:
+                shown = stale.relative_to(ROOT)
+            except ValueError:
+                shown = stale
+            print(f"{shown}: removed, Kconfig will reseed it from the fragment")
 
 
 if __name__ == "__main__":

@@ -73,10 +73,34 @@ the passphrase:
 
 ```sh
 cp config.example.toml config.toml   # then edit it
-
 tools/idf.sh build
 tools/idf.sh -p /dev/ttyACM0 flash monitor
 ```
+
+### With espflash instead
+
+`espflash` takes the ELF and finds the bootloader and partition table itself
+(in 4.x `--partition-table` wants a CSV, so use the ELF rather than the `.bin`):
+
+```sh
+cd firmware
+espflash flash -c esp32s3 -p /dev/ttyACM0 -B 460800 \
+  -m dio -f 80mhz -s 16mb build/weather_glass.elf -M
+```
+
+The `-M` monitors afterwards. The offsets and flash settings above are exactly
+`firmware/build/flasher_args.json` (`0x0` bootloader, `0x8000` partitions,
+`0x10000` app); to write the pieces by hand, `espflash write-bin` takes an
+address per file. To read the log without reflashing:
+
+```sh
+espflash monitor -c esp32s3 -p /dev/ttyACM0 -a hard-reset
+```
+
+Note that the USB-Serial-JTAG port disappears while the board is asleep, so the
+port can look gone for a whole refresh interval — that is the alarm working,
+not a dead board. Hold OK (GPIO0, also the download strap) and tap RESET to put
+it in the ROM bootloader if it will not answer.
 
 `tools/idf.sh build` regenerates `firmware/sdkconfig.defaults.local` from
 `config.toml` (via `tools/gen_config.py`) as part of CMake configure, so the
@@ -87,6 +111,57 @@ naming the key, rather than flashing a device that cannot reach the network.
 `tools/idf.sh` wraps this machine's ESP-IDF v6.1 install (see the comment at
 the top — the stock `export.sh` does not work with the IDF Installation
 Manager layout).
+
+### When the schedule looks ignored
+
+`firmware/sdkconfig` is generated, and Kconfig only applies
+`sdkconfig.defaults*` to symbols it does not already answer. So an old value in
+`sdkconfig` silently outranks `config.toml` forever — a bench-test
+`day_interval_min = 1` once kept a panel refreshing every minute while the TOML
+said 20. `tools/gen_config.py` now deletes `firmware/sdkconfig` whenever the
+generated fragment changes, and every wake logs the schedule it actually
+compiled with:
+
+```
+I (301) glass: schedule: day 30 min, night 120 min, retry 5 min, force refresh every 21600 s
+```
+
+If that line disagrees with `config.toml`, the build did not reseed; delete
+`firmware/sdkconfig` by hand and rebuild.
+
+## Cadence, and not redrawing
+
+Two rules keep the cell alive, because an e-paper picture costs nothing to
+*keep* and everything worth saving is spent on making one:
+
+1. **The interval is a whole number of the API's model steps.** Open-Meteo's
+   `current` block is stamped with the start of its 900 s model step, so a fetch
+   four minutes after a boundary returns the same picture as one just before
+   it. `weather_model.cc` rounds any gap of 900 s or more *up* to whole steps.
+   It deliberately does not round the wake time itself onto a boundary: a wake
+   takes ~15 s, so `now` is always just after the last target, and rounding up
+   then walks every later wake a step further out — a measured 7200 s night gap
+   became 8086 s. Aligning the interval keeps the cadence exact at any phase
+   and still puts every fetch on a fresh step.
+2. **An unchanged frame is never sent.** The quantised 4 bpp frame is hashed
+   (FNV-1a) into RTC slow memory and compared on the next wake. If the pixels
+   agree, the panel is not even powered up — no SPI, no waveform, no 7 s wait.
+   The temperature sits still for several model steps and the sky plate is
+   chosen by hour, so most daytime wakes used to redraw a pixel-identical
+   picture. A frame is forced anyway after 6 h or 8 consecutive skips, and
+   always after a power cycle, when there is no honest memory of what is on the
+   glass.
+
+```
+I (14504) glass: panel: 28°C Partly cloudy scene=cloud in 7329 ms
+I (13:41) glass: panel: 28°C Partly cloudy scene=cloud unchanged, refresh skipped (1 running)
+```
+
+The driver also offers `zectrix_epd_refresh_partial_1bpp`, but only for a
+black-and-white base: partial refresh is unsupported after a 4 bpp frame until a
+full 1 bpp refresh re-establishes a B/W base. Partial updates would therefore
+cost the grayscale and the plate artwork, which is the entire point of the
+thing — skipping the redraw is both cheaper and better.
 
 Assets are generated, not checked in by hand:
 

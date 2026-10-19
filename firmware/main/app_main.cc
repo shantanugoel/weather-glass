@@ -112,6 +112,40 @@ constexpr int64_t kSpuriousMinIntendedSec = 5 * 60;
  */
 constexpr int64_t kObservationGridSec = 1200;
 
+/**
+ * What the panel is showing, as a hash of the quantised frame.
+ *
+ * e-paper is bistable: the picture costs nothing to keep, and the 7 s full
+ * 16-gray refresh is the most expensive thing this device does - well over
+ * half a normal wake. A 30-minute schedule therefore spends most of its
+ * energy redrawing a picture that has not changed: the temperature is often
+ * the same for two or three consecutive model steps, and the sky plate is
+ * chosen by hour, not by minute.
+ *
+ * So compare the frame we are about to send with the one the panel was last
+ * told to show, and send nothing when they agree. The comparison is on the
+ * *quantised* frame rather than the snapshot, so it also covers the clock
+ * text, the icon and any layout change: if the pixels differ at all, they
+ * differ on the wall, and the refresh happens.
+ *
+ * RTC slow memory because it has to survive deep sleep without a flash write.
+ * A power cycle clears it (see app_main), which is the right answer: after a
+ * battery swap or a cold boot we have no idea what is on the glass, so it gets
+ * drawn.
+ */
+RTC_NOINIT_ATTR uint64_t g_frame_hash;
+RTC_NOINIT_ATTR int64_t g_frame_shown_utc;
+RTC_NOINIT_ATTR uint32_t g_frame_skips;
+/**
+ * Redraw regardless, however unchanged, after this long. The panel has no
+ * ghosting of its own once a frame is written, but a comparison is only as
+ * good as the memory behind it, and an occasional honest full refresh costs
+ * nothing worth arguing about.
+ */
+constexpr int64_t kForceRefreshSec = 6 * 3600;
+/** Same belt and braces in wake counts: at 30 min, four hours. */
+constexpr uint32_t kMaxFrameSkips = 8;
+
 ZectrixBoard g_board;
 
 /**
@@ -433,8 +467,18 @@ uint8_t* psram_plane(size_t bytes) {
     return p;
 }
 
+/** FNV-1a over the finished frame; 60 KB takes about a millisecond. */
+uint64_t fnv1a64(const uint8_t* p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h = (h ^ p[i]) * 0x100000001b3ULL;
+    }
+    return h;
+}
+
 void draw(zectrix_epd_handle_t epd, const weather_snapshot_t& snap,
-          const glass_card_data_t& card, const char* status) {
+          const glass_card_data_t& card, const char* status,
+          bool force_full = false) {
     uint8_t* px = psram_plane(GLASS_PIXELS);
     uint8_t* weight = psram_plane(GLASS_PIXELS);
     uint8_t* scratch = psram_plane(GLASS_SCRATCH_BYTES);
@@ -481,6 +525,34 @@ void draw(zectrix_epd_handle_t epd, const weather_snapshot_t& snap,
     glass_quantize(&canvas, frame, ZECTRIX_EPD_4BPP_FRAME_BYTES,
                    GLASS_DITHER_BAYER8, 255);
 
+    // Decided before the rail is switched on: the saving is the refresh and
+    // the power-on together, so weighing it up afterwards would be pointless.
+    const uint64_t hash = fnv1a64(frame, ZECTRIX_EPD_4BPP_FRAME_BYTES);
+    const int64_t wall = time(nullptr);
+    const bool clock_ok = wall > 1704067200;  // 2024: see clock_looks_valid()
+    const bool identical = hash != 0 && hash == g_frame_hash;
+    // A clock that has not been set, or has run backwards past the last
+    // refresh, cannot vouch for how old the picture is: refresh.
+    const bool fresh = clock_ok && g_frame_shown_utc > 0 &&
+                       wall >= g_frame_shown_utc &&
+                       wall - g_frame_shown_utc <= kForceRefreshSec &&
+                       g_frame_skips < kMaxFrameSkips;
+    if (identical && fresh && !force_full) {
+        ++g_frame_skips;
+        ESP_LOGI(kTag, "panel: %s%s %s scene=%s unchanged, refresh skipped (%" PRIu32
+                       " running)",
+                 card.temp, card.unit, status != nullptr ? status : card.condition,
+                 scene, g_frame_skips);
+        return;
+    }
+    if (identical && !force_full) {
+        ESP_LOGI(kTag, "panel: frame unchanged but %lld s / %" PRIu32
+                       " skips since the last refresh; drawing anyway",
+                 clock_ok ? static_cast<long long>(wall - g_frame_shown_utc)
+                          : -1LL,
+                 g_frame_skips);
+    }
+
     ESP_ERROR_CHECK(zectrix_epd_power_on(epd));
     const int64_t t0 = esp_timer_get_time();
     const esp_err_t err = zectrix_epd_refresh_full_4bpp(
@@ -494,6 +566,11 @@ void draw(zectrix_epd_handle_t epd, const weather_snapshot_t& snap,
         ESP_LOGI(kTag, "panel: %s%s %s scene=%s in %ld ms", card.temp, card.unit,
                  status != nullptr ? status : card.condition, scene,
                  static_cast<long>((esp_timer_get_time() - t0) / 1000));
+        // Only a refresh that reached the panel may be claimed as what the
+        // panel is showing, or a failed draw would suppress its own retry.
+        g_frame_hash = hash;
+        g_frame_shown_utc = wall;
+        g_frame_skips = 0;
     }
     ESP_ERROR_CHECK(zectrix_epd_power_off(epd));
     (void)status;
@@ -625,7 +702,9 @@ void recovery_loop(zectrix_epd_handle_t epd) {
                             glass_card_data_t card = {};
                             weather_format_card(&snap, CONFIG_GLASS_CITY, now_utc,
                                                 Latitude(), Longitude(), &card);
-                            draw(epd, snap, card, nullptr);
+                            // A keypress is an operator asking to see the glass,
+                            // not an optimisation opportunity: always draw it.
+                            draw(epd, snap, card, nullptr, /*force_full=*/true);
                         } else {
                             ESP_LOGW(kTag, "nothing to draw yet, press f first");
                         }
@@ -673,6 +752,11 @@ extern "C" void app_main(void) {
         g_spurious_wakes = 0;
         g_sleep_started_local = 0;
         g_sleep_target_local = 0;
+        // Nothing is known about the glass after a cold boot, so the first
+        // frame is always written rather than compared with RTC garbage.
+        g_frame_hash = 0;
+        g_frame_shown_utc = 0;
+        g_frame_skips = 0;
     }
 
     esp_err_t nvs = nvs_flash_init();
@@ -684,6 +768,19 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(g_board.Init());
     g_board.SetPowerLed(false);
+
+    // The compiled-in schedule, on every wake. These constants come from
+    // config.toml via sdkconfig.defaults.local, and Kconfig only applies a
+    // default to a symbol that firmware/sdkconfig does not already answer - so
+    // this line is what makes a stale sdkconfig visible instead of silently
+    // refreshing the panel once a minute for weeks. tools/gen_config.py
+    // invalidates sdkconfig when the fragment changes; this says what won.
+    ESP_LOGI(kTag, "schedule: day %lld min, night %lld min, retry %lld min, "
+                   "force refresh every %lld s",
+             static_cast<long long>(kDayGapSec / 60),
+             static_cast<long long>(kNightGapSec / 60),
+             static_cast<long long>(kRetryGapSec / 60),
+             static_cast<long long>(kForceRefreshSec));
 
     // Before anything that can open a TLS socket: certificate validation reads
     // the system clock, which comes up at 1970.

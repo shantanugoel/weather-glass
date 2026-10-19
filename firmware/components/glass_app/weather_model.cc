@@ -284,6 +284,22 @@ extern "C" void weather_format_card(const weather_snapshot_t* s, const char* cit
     }
 }
 
+/**
+ * Open-Meteo's model step. Its own payload says so (`interval: 900`), and the
+ * `current` block is stamped with the start of the step it came from, so
+ * nothing the panel can show changes between two boundaries: fetching 4
+ * minutes after one buys the same picture, at the same radio cost, as fetching
+ * just before the next.
+ */
+constexpr int64_t kFetchGridSec = 900;
+
+/**
+ * Below one model step there is nothing to align. This is the bench-test
+ * range - a minute between wakes while somebody is watching a serial log - and
+ * rounding those up to 15 minutes would make the option useless.
+ */
+constexpr int64_t kMinFetchGapSec = 60;
+
 extern "C" int64_t weather_next_fetch_delay_sec(const weather_snapshot_t* snap,
                                                 int64_t now_utc, float latitude,
                                                 float longitude, int64_t day_gap,
@@ -291,5 +307,24 @@ extern "C" int64_t weather_next_fetch_delay_sec(const weather_snapshot_t* snap,
     (void)snap;
     const bool day = weather_daylight(now_utc, latitude, longitude);
     const int64_t gap = day ? day_gap : night_gap;
-    return gap < 60 ? 60 : gap;
+    int64_t delay = gap < kMinFetchGapSec ? kMinFetchGapSec : gap;
+
+    // Snap the *interval* to whole model steps, never the absolute time.
+    //
+    // Rounding the target clock time up to a boundary looks like the obvious
+    // thing to do and does not work: a wake takes ~15 s, so `now` is always
+    // just *after* the previous target, and rounding up then pushes every
+    // later wake a step further out - 30 minutes becomes 45, measured as
+    // 8086 s for a 7200 s night gap. The phase is unfixable; the interval is.
+    // A whole number of steps from any phase still lands every fetch on a
+    // boundary, so the cadence is exact and no wake is spent re-reading a
+    // step the panel already shows.
+    //
+    // Both shipped gaps (30 min, 2 h) are already whole steps, so this is a
+    // no-op for the default config; it is here for a 20-minute `config.toml`,
+    // which would otherwise alternate between a fresh step and a stale one.
+    if (delay >= kFetchGridSec) {
+        delay = (delay + kFetchGridSec - 1) / kFetchGridSec * kFetchGridSec;
+    }
+    return delay;
 }

@@ -68,7 +68,11 @@ void weather_format_card(const weather_snapshot_t* snap, const char* city,
 
 /**
  * Seconds until the next fetch: `day_gap` while the sun is up, `night_gap`
- * when it is down, clamped to at least 60 s.
+ * when it is down, never less than 60 s. At or above one Open-Meteo model step
+ * (900 s) the interval is rounded up to a whole number of steps, so every
+ * fetch can see an observation that has actually moved; below a step there is
+ * nothing to align, and the value is returned untouched. Both shipped gaps,
+ * 30 min and 2 h, are already whole steps and come back unchanged.
  */
 int64_t weather_next_fetch_delay_sec(const weather_snapshot_t* snap,
                                      int64_t now_utc, float latitude,
