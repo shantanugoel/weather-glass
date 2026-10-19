@@ -1,0 +1,68 @@
+menu "Weather Glass"
+
+    config GLASS_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Set it in sdkconfig.defaults.local (not tracked) rather than here,
+            so the credential does not end up in the repository.
+
+    config GLASS_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config GLASS_LATITUDE
+        string "Latitude"
+        default "12.9698"
+        help
+            Decimal degrees, south negative. Drives the sun and moon position,
+            the star field, day/night and the fetch.
+
+    config GLASS_LONGITUDE
+        string "Longitude"
+        default "77.7499"
+
+    config GLASS_CITY
+        string "City name shown in the header"
+        default "Bengaluru"
+        help
+            Left blank, the header falls back to the city part of the
+            timezone Open-Meteo reports.
+
+    config GLASS_TIMEZONE
+        string "Open-Meteo timezone"
+        default "auto"
+        help
+            "auto" makes the API pick from the coordinates and return the UTC
+            offset it used, which is what the RTC is set from. Pin it to a
+            name like Asia/Kolkata if the device sits near a zone boundary.
+
+    config GLASS_UTC_OFFSET_SEC
+        int "Fallback UTC offset in seconds (used only when offline)"
+        default 19800
+        help
+            Applied to the RTC when no fetch succeeded, so the clock keeps
+            showing sensible local time between refreshes.
+
+    config GLASS_DAY_INTERVAL_MIN
+        int "Minutes between fetches while the sun is up"
+        default 20
+        range 1 1440
+
+    config GLASS_NIGHT_INTERVAL_MIN
+        int "Minutes between fetches while the sun is down"
+        default 120
+        range 1 1440
+        help
+            Overnight the temperature moves a couple of degrees and nobody is
+            looking at the panel, so this can be slow.
+
+    config GLASS_RETRY_INTERVAL_MIN
+        int "Minutes before a failed fetch is retried"
+        default 5
+        range 1 1440
+        help
+            Not so soon that a dead access point drains the cell in an
+            afternoon.
+
+endmenu

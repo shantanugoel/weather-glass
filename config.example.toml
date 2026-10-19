@@ -1,0 +1,34 @@
+# Weather Glass configuration.
+#
+# Copy to config.toml at the repository root and fill in. The firmware build
+# reads config.toml (via tools/gen_config.py) and generates
+# firmware/sdkconfig.defaults.local from it, so this is the only file to edit;
+# config.toml itself is gitignored because it holds the Wi-Fi passphrase.
+
+[wifi]
+ssid = "your-ssid"
+password = "your-password"
+
+[location]
+# Decimal degrees, south/west negative. These drive the fetch *and* the sky:
+# the sun, moon, star field and day/night are all computed from them.
+latitude = 12.9698
+longitude = 77.7499
+city = "Bengaluru"
+
+# "auto" makes Open-Meteo pick the zone from the coordinates and return the
+# offset it used, which is what sets the RTC. Pin an IANA name like
+# "Asia/Kolkata" if the device sits near a zone boundary.
+timezone = "auto"
+
+# Used only when a fetch fails, so the clock still shows local time.
+utc_offset_sec = 19800
+
+[schedule]
+# Minutes between fetches. Overnight the temperature moves a couple of degrees
+# and nobody is looking at the panel, so night can be slow.
+day_interval_min = 20
+night_interval_min = 120
+
+# Minutes before a failed fetch is retried.
+retry_interval_min = 5

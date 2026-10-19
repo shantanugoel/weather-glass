@@ -1,0 +1,37 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# NOTE4 is an ESP32-S3 N16R8: 16 MB flash, 8 MB octal PSRAM. Only ~2 MB of
+# flash is used, but the PSRAM is not optional - the compositor holds five
+# 400x300 planes, which will not fit in the 512 KB of SRAM.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_FREERTOS_HZ=1000
+
+# The Note 4 exposes only USB-Serial/JTAG, so the console has to live there or
+# `idf.py monitor` shows nothing at all.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Open-Meteo is HTTPS and this is an unattended device that will hold its
+# Wi-Fi credential for years, so TLS is verified against the CA bundle.
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# A full 16-level refresh plus TLS negotiation runs long enough to trip the
+# default watchdog.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+
+# Everything below the deep-sleep boundary is dead weight, but a board that
+# will not wake up is a brick, so keep the sleep driver's asserts on.
+CONFIG_PM_ENABLE=n
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
