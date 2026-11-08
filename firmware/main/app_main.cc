@@ -10,6 +10,8 @@
  * so the ESP is not keeping time itself, and the two front buttons share the
  * wake mask so a press re-draws immediately.
  */
+#include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -21,11 +23,13 @@
 #include <unistd.h>
 
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "esp_sleep.h"
+#include "esp_stdio.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -48,7 +52,7 @@ namespace {
 
 constexpr const char* kTag = "glass";
 
-// 20 minutes by day, 2 hours at night: overnight the temperature moves a
+// 30 minutes by day, 2 hours at night: overnight the temperature moves a
 // couple of degrees and nobody is looking at the panel. Configurable in
 // config.toml, clamped by Kconfig to sane values.
 constexpr int64_t kDayGapSec = CONFIG_GLASS_DAY_INTERVAL_MIN * 60;
@@ -467,6 +471,25 @@ uint8_t* psram_plane(size_t bytes) {
     return p;
 }
 
+/**
+ * Owning PSRAM plane.
+ *
+ * A wake allocates these and then resets the chip, so for a long time nothing
+ * freed them. A bench session that draws repeatedly does not reset: without
+ * this, each draw leaked the five framebuffer-sized planes (~350 KB) and the
+ * panel stopped updating after a dozen presses. Freeing is also just correct on
+ * the early "frame unchanged" return.
+ */
+struct PsramPlane {
+    explicit PsramPlane(size_t bytes) : p(psram_plane(bytes)) {}
+    ~PsramPlane() {
+        if (p != nullptr) heap_caps_free(p);
+    }
+    PsramPlane(const PsramPlane&) = delete;
+    PsramPlane& operator=(const PsramPlane&) = delete;
+    uint8_t* p;
+};
+
 /** FNV-1a over the finished frame; 60 KB takes about a millisecond. */
 uint64_t fnv1a64(const uint8_t* p, size_t n) {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -479,11 +502,16 @@ uint64_t fnv1a64(const uint8_t* p, size_t n) {
 void draw(zectrix_epd_handle_t epd, const weather_snapshot_t& snap,
           const glass_card_data_t& card, const char* status,
           bool force_full = false) {
-    uint8_t* px = psram_plane(GLASS_PIXELS);
-    uint8_t* weight = psram_plane(GLASS_PIXELS);
-    uint8_t* scratch = psram_plane(GLASS_SCRATCH_BYTES);
-    uint8_t* frame = psram_plane(ZECTRIX_EPD_4BPP_FRAME_BYTES);
-    uint8_t* workspace = psram_plane(380 * 110);
+    PsramPlane px_plane(GLASS_PIXELS);
+    PsramPlane weight_plane(GLASS_PIXELS);
+    PsramPlane scratch_plane(GLASS_SCRATCH_BYTES);
+    PsramPlane frame_plane(ZECTRIX_EPD_4BPP_FRAME_BYTES);
+    PsramPlane workspace_plane(380 * 110);
+    uint8_t* px = px_plane.p;
+    uint8_t* weight = weight_plane.p;
+    uint8_t* scratch = scratch_plane.p;
+    uint8_t* frame = frame_plane.p;
+    uint8_t* workspace = workspace_plane.p;
     if (px == nullptr || weight == nullptr || scratch == nullptr ||
         frame == nullptr || workspace == nullptr) {
         ESP_LOGE(kTag, "out of memory for a frame");
@@ -668,6 +696,30 @@ bool update_panel(zectrix_epd_handle_t epd, bool clock_from_rtc,
 }
 
 /**
+ * Console key polling.
+ *
+ * The USB-Serial-JTAG console is not fd 0 on this ESP-IDF port: stdin is the
+ * newlib console path, while the USB device lives behind /dev/console. Worse,
+ * select() on stdin returns immediately instead of waiting, which is why the
+ * recovery commands were unreachable - the code looked right and never saw a
+ * byte. Opening /dev/console explicitly and polling it non-blocking is what the
+ * VFS actually supports here.
+ */
+int open_console_poll() {
+    const int fd = open("/dev/console", O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        ESP_LOGW(kTag, "console is not pollable (errno %d)", errno);
+    }
+    return fd;
+}
+
+int read_console_key(int fd) {
+    if (fd < 0) return -1;
+    char c = 0;
+    return read(fd, &c, 1) == 1 ? static_cast<unsigned char>(c) : -1;
+}
+
+/**
  * Hold OK as the app comes up and the device refuses to sleep.
  *
  * The Note 4 has a RESET pin-hole and OK is GPIO0, the download-mode strap, so
@@ -684,50 +736,46 @@ void recovery_loop(zectrix_epd_handle_t epd) {
     int64_t now_utc = 0;
     bool have = false;
     uint32_t beat = 0;
+    const int console_fd = open_console_poll();
     while (true) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        timeval tv = {0, 200000};
-        if (select(STDIN_FILENO + 1, &rfds, nullptr, nullptr, &tv) > 0) {
-            char c = 0;
-            if (read(STDIN_FILENO, &c, 1) == 1) {
-                ESP_LOGI(kTag, "recovery command '%c'", c);
-                switch (c) {
-                    case 'f':
-                        have = update_panel(epd, true, &snap, &now_utc);
-                        break;
-                    case 'r':
-                        if (have) {
-                            glass_card_data_t card = {};
-                            weather_format_card(&snap, CONFIG_GLASS_CITY, now_utc,
-                                                Latitude(), Longitude(), &card);
-                            // A keypress is an operator asking to see the glass,
-                            // not an optimisation opportunity: always draw it.
-                            draw(epd, snap, card, nullptr, /*force_full=*/true);
-                        } else {
-                            ESP_LOGW(kTag, "nothing to draw yet, press f first");
-                        }
-                        break;
-                    case 'n':
-                        sync_clock_via_ntp(3000);
-                        break;
-                    case 'b': {
-                        const ZectrixPowerSnapshot p = g_board.ReadPowerSnapshot();
-                        ESP_LOGI(kTag, "battery %u mV (%u%%)", p.battery_mv,
-                                 p.battery_percent);
-                        break;
+        const int key = read_console_key(console_fd);
+        if (key >= 0) {
+            const char c = static_cast<char>(key);
+            ESP_LOGI(kTag, "recovery command '%c'", c);
+            switch (c) {
+                case 'f':
+                    have = update_panel(epd, true, &snap, &now_utc);
+                    break;
+                case 'r':
+                    if (have) {
+                        glass_card_data_t card = {};
+                        weather_format_card(&snap, CONFIG_GLASS_CITY, now_utc,
+                                            Latitude(), Longitude(), &card);
+                        // A keypress is an operator asking to see the glass, not
+                        // an optimisation opportunity: always draw it.
+                        draw(epd, snap, card, nullptr, /*force_full=*/true);
+                    } else {
+                        ESP_LOGW(kTag, "nothing to draw yet, press f first");
                     }
-                    case 's':
-                        ESP_LOGW(kTag, "leaving recovery, sleeping 60 s");
-                        sleep_for(60);
-                        break;
-                    case 'q':
-                        esp_restart();
-                        break;
-                    default:
-                        break;
+                    break;
+                case 'n':
+                    sync_clock_via_ntp(3000);
+                    break;
+                case 'b': {
+                    const ZectrixPowerSnapshot p = g_board.ReadPowerSnapshot();
+                    ESP_LOGI(kTag, "battery %u mV (%u%%)", p.battery_mv,
+                             p.battery_percent);
+                    break;
                 }
+                case 's':
+                    ESP_LOGW(kTag, "leaving recovery, sleeping 60 s");
+                    sleep_for(60);
+                    break;
+                case 'q':
+                    esp_restart();
+                    break;
+                default:
+                    break;
             }
         }
         // Blink so the mode is visible without a serial cable.
@@ -738,6 +786,122 @@ void recovery_loop(zectrix_epd_handle_t epd) {
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+}
+
+/** Seconds until the next wake, including the offline backoff. */
+int64_t plan_next_delay(bool fetched, const weather_snapshot_t& snap,
+                        int64_t now_utc) {
+    if (fetched) {
+        g_fail_streak = 0;
+        return weather_next_fetch_delay_sec(&snap, now_utc, Latitude(), Longitude(),
+                                            kDayGapSec, kNightGapSec);
+    }
+    // Doubling from the configured retry gap, capped, so an outage costs one
+    // wake per four hours instead of one per five minutes.
+    if (g_fail_streak < 16) ++g_fail_streak;
+    int64_t delay = kRetryGapSec;
+    for (uint32_t i = 1; i < g_fail_streak && delay < kMaxOfflineSec; ++i) {
+        delay *= 2;
+    }
+    if (delay > kMaxOfflineSec) delay = kMaxOfflineSec;
+    ESP_LOGW(kTag, "offline for %" PRIu32 " wake(s); retrying in %lld s",
+             g_fail_streak, static_cast<long long>(delay));
+    return delay;
+}
+
+/**
+ * True when this boot should stay awake and keep USB-Serial-JTAG enumerated.
+ *
+ * `usb_serial_jtag_is_connected()` is the useful half: it is true only while a
+ * real USB host is sending SOF packets, so a wall charger - which cannot wake
+ * the chip and cannot be flashed - still lets the board deep sleep. Plugged
+ * into a machine for monitor/flash work, the port no longer disappears for the
+ * whole refresh interval, and the normal fetch/render cycle keeps running in
+ * the loop below instead of the chip resetting every 30 minutes. Unplugging
+ * returns it to the ordinary schedule on the next check.
+ *
+ * The explicit `[debug] stay_awake = true` in config.toml forces the same mode
+ * with no host, for a bench supply where the USB data lines are not connected.
+ */
+bool bench_mode_requested() {
+#ifdef CONFIG_GLASS_STAY_AWAKE
+    return true;
+#else
+    return usb_serial_jtag_is_connected();
+#endif
+}
+
+/**
+ * Hold the port open until the next cycle, or until somebody asks for one.
+ *
+ * Deep sleep is what normally keeps the port down between cycles; staying
+ * awake means the loop has to wait, and a plain vTaskDelay would make a bench
+ * session deaf for half an hour. One-second ticks pace the wait and poll
+ * /dev/console, so a keystroke is answered without powering the USB down.
+ */
+void bench_wait(int64_t seconds) {
+    ESP_LOGI(kTag, "bench: staying enumerated; next cycle in %lld s "
+                   "(f=now b=battery q=reboot)",
+             static_cast<long long>(seconds));
+    // Poll /dev/console rather than select()ing stdin: see open_console_poll().
+    // The one-second tick is the clock; it is also what keeps an unsupported
+    // wait from turning this into a spin that burns the interval in milliseconds.
+    const int console_fd = open_console_poll();
+    int64_t elapsed = 0;
+    while (elapsed < seconds) {
+        if (!bench_mode_requested()) break;  // cable pulled: fall back to sleep
+        const int key = read_console_key(console_fd);
+        if (key == 'f') {
+            ESP_LOGI(kTag, "bench: cycle requested");
+            break;
+        }
+        if (key == 'b') {
+            const ZectrixPowerSnapshot p = g_board.ReadPowerSnapshot();
+            ESP_LOGI(kTag, "battery %u mV (%u%%)", p.battery_mv,
+                     p.battery_percent);
+        } else if (key == 'q') {
+            esp_restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ++elapsed;
+        if (elapsed % 300 == 0 && elapsed < seconds) {
+            ESP_LOGI(kTag, "bench: still awake, %lld s until the next cycle",
+                     static_cast<long long>(seconds - elapsed));
+        }
+    }
+    if (console_fd >= 0) close(console_fd);
+}
+
+bool wake_was_button() {
+    const uint32_t causes = esp_sleep_get_wakeup_causes();
+    if ((causes & BIT(ESP_SLEEP_WAKEUP_EXT1)) == 0) return false;
+    constexpr uint64_t kButtonMask = (1ULL << ZECTRIX_BUTTON_OK) |
+                                     (1ULL << ZECTRIX_BUTTON_DOWN);
+    return (esp_sleep_get_ext1_wakeup_status() & kButtonMask) != 0;
+}
+
+bool buttons_still_held() {
+    return gpio_get_level(ZECTRIX_BUTTON_OK) == 0 ||
+           gpio_get_level(ZECTRIX_BUTTON_DOWN) == 0;
+}
+
+/**
+ * A button wake is a person asking to see the panel, not a stuck line.
+ *
+ * The spurious-wake guard below cannot tell a deliberate press from a pad
+ * held low, and it used to swallow the press: the board woke, decided it was
+ * too early, and went straight back to sleep, so pressing OK did not refresh
+ * anything. Give the button two seconds to be released - long enough for a
+ * normal press held until the first log line, short enough that a shorted pad
+ * is still caught - and only then call it deliberate.
+ */
+bool button_press_was_deliberate() {
+    if (!wake_was_button()) return false;
+    for (int i = 0; i < 20; ++i) {
+        if (!buttons_still_held()) return true;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return false;
 }
 
 extern "C" void app_main(void) {
@@ -766,6 +930,12 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(nvs);
 
+    // The USB console's VFS is registered at startup, but its I/O driver is
+    // installed only by esp_console_init(), which this app does not run. Without
+    // this call /dev/console reads the bare RX FIFO and never sees a host byte,
+    // so the bench and recovery single-key commands would be dead code.
+    ESP_ERROR_CHECK(esp_stdio_install_io_driver());
+
     ESP_ERROR_CHECK(g_board.Init());
     g_board.SetPowerLed(false);
 
@@ -787,12 +957,27 @@ extern "C" void app_main(void) {
     const bool clock_from_rtc = sync_clock_from_rtc();
     log_wake_detail();
 
+    // Decided before the spurious-wake check: with a host attached, going back
+    // to sleep is precisely what makes the port disappear under a monitor, so
+    // a debug session must survive the guard. It is also disarmed here because
+    // no deep sleep is coming while bench mode lasts.
+    bool bench = bench_mode_requested();
+    if (bench) {
+        ESP_LOGW(kTag, "USB host attached or [debug] stay_awake set: the port "
+                       "will stay enumerated");
+        if (g_board.rtc() != nullptr) {
+            g_board.rtc()->DisableAlarm();
+            g_board.rtc()->ClearAlarmFlag();
+        }
+    }
+
     // A wake far too early for the alarm we armed is the wake line, not the
     // alarm. Go back to sleep with the time still owed rather than paying for
     // Wi-Fi, a fetch and a full panel refresh - the panel cannot take that
     // every few seconds, and the battery cannot either. After a bounded number
     // of attempts the cycle runs anyway, so a genuinely stuck line still shows
-    // a current forecast instead of freezing on an old frame.
+    // a current forecast instead of freezing on an old frame. A deliberate
+    // button press and a USB debug session are both excused from this.
     tm wake_tm = {};
     int64_t wake_local = 0;
     if (g_sleep_target_local < g_sleep_started_local) g_sleep_started_local = 0;  // cold-boot garbage
@@ -801,7 +986,17 @@ extern "C" void app_main(void) {
         const int64_t intended = g_sleep_target_local - g_sleep_started_local;
         const int64_t slept = wake_local - g_sleep_started_local;
         if (intended >= kSpuriousMinIntendedSec && slept < kSpuriousWakeSec) {
-            if (g_spurious_wakes < kMaxSpuriousWakes) {
+            const bool button_press =
+                bench ? false : button_press_was_deliberate();
+            if (bench) {
+                ESP_LOGI(kTag, "woke %" PRId64 " s into a %" PRId64
+                               " s alarm; bench mode keeps the port up",
+                         slept, intended);
+            } else if (button_press) {
+                ESP_LOGI(kTag, "woke %" PRId64 " s into a %" PRId64
+                               " s alarm; button press, drawing now",
+                         slept, intended);
+            } else if (g_spurious_wakes < kMaxSpuriousWakes) {
                 ++g_spurious_wakes;
                 const int64_t remaining =
                     intended - slept < 30 ? 30 : intended - slept;
@@ -810,11 +1005,12 @@ extern "C" void app_main(void) {
                                "), sleeping %" PRId64 " s more",
                          slept, intended, g_spurious_wakes, remaining);
                 sleep_for(remaining);
+            } else {
+                ESP_LOGE(kTag,
+                         "wake line still low after %" PRIu32 " attempts; running a full "
+                         "cycle anyway",
+                         g_spurious_wakes);
             }
-            ESP_LOGE(kTag,
-                     "wake line still low after %" PRIu32 " attempts; running a full "
-                     "cycle anyway",
-                     g_spurious_wakes);
         }
         g_spurious_wakes = 0;
     }
@@ -828,28 +1024,20 @@ extern "C" void app_main(void) {
     // driven into recovery is a board somebody is about to flash.
     if (button_held_at_boot(ZECTRIX_BUTTON_OK)) recovery_loop(epd);
 
-    weather_snapshot_t snap = {};
-    int64_t now_utc = 0;
-    const bool fetched = update_panel(epd, clock_from_rtc, &snap, &now_utc);
+    for (;;) {
+        weather_snapshot_t snap = {};
+        int64_t now_utc = 0;
+        const bool fetched = update_panel(epd, clock_from_rtc, &snap, &now_utc);
+        const int64_t delay = plan_next_delay(fetched, snap, now_utc);
 
-    zectrix_epd_del(epd);
-
-    int64_t delay = 0;
-    if (fetched) {
-        g_fail_streak = 0;
-        delay = weather_next_fetch_delay_sec(&snap, now_utc, Latitude(), Longitude(),
-                                            kDayGapSec, kNightGapSec);
-    } else {
-        // Doubling from the configured retry gap, capped, so an outage costs
-        // one wake per four hours instead of one per five minutes.
-        if (g_fail_streak < 16) ++g_fail_streak;
-        delay = kRetryGapSec;
-        for (uint32_t i = 1; i < g_fail_streak && delay < kMaxOfflineSec; ++i) {
-            delay *= 2;
+        if (bench) {
+            bench_wait(delay);
+            if (bench_mode_requested()) continue;
+            ESP_LOGW(kTag, "USB host gone; resuming the deep-sleep schedule");
+            bench = false;
         }
-        if (delay > kMaxOfflineSec) delay = kMaxOfflineSec;
-        ESP_LOGW(kTag, "offline for %" PRIu32 " wake(s); retrying in %lld s",
-                 g_fail_streak, static_cast<long long>(delay));
+
+        zectrix_epd_del(epd);
+        sleep_for(delay);
     }
-    sleep_for(delay);
 }

@@ -18,7 +18,7 @@ RTC alarm ──▶ wake ──▶ Wi-Fi ──▶ Open-Meteo ──▶ parse �
               └──────── EXT1 on PCF8563 INT ◀──────────┘
 ```
 
-One wake does one fetch, one render, one refresh. Cadence is 20 minutes by day
+One wake does one fetch, one render, one refresh. Cadence is 30 minutes by day
 and 2 hours at night (`weather_next_fetch_delay_sec`), and a failed fetch
 retries in 5 minutes rather than freezing the panel.
 
@@ -101,6 +101,32 @@ Note that the USB-Serial-JTAG port disappears while the board is asleep, so the
 port can look gone for a whole refresh interval — that is the alarm working,
 not a dead board. Hold OK (GPIO0, also the download strap) and tap RESET to put
 it in the ROM bootloader if it will not answer.
+
+### Staying enumerated while debugging
+
+The port normally vanishes because the chip deep sleeps. When a real USB host
+is attached (a charger is not: the check looks for USB SOF packets) the
+firmware keeps itself awake instead, running the normal fetch/render cycle on
+schedule and holding the port open between cycles. Plug the board into the
+machine, let it wake (a button press, or the next alarm), and `/dev/ttyACM0`
+stays there; unplug it and the next check returns the board to its battery
+schedule. While awake it answers a few single-key commands on the console:
+
+```
+f  run a fetch/render cycle now
+b  print the battery voltage
+q  reboot
+```
+
+`[debug] stay_awake = true` in `config.toml` forces the same mode without a
+host, for a bench supply whose data lines are not connected. The OK-hold
+recovery loop above is still the way in when the firmware is too wedged to
+reach this path.
+
+`tools/flash_on_wake.sh` exists for the awkward case: it waits for the port to
+re-enumerate and starts `espflash` immediately, so a flash is not a race
+against the wake window. `tools/capture_wake.py` is a plain reader that keeps a
+log across sleep cycles (it is what `flash_on_wake.sh` restarts afterwards).
 
 `tools/idf.sh build` regenerates `firmware/sdkconfig.defaults.local` from
 `config.toml` (via `tools/gen_config.py`) as part of CMake configure, so the

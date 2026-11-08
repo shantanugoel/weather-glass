@@ -35,3 +35,10 @@ night_interval_min = 120
 
 # Minutes before a failed fetch is retried.
 retry_interval_min = 5
+
+[debug]
+# Keep the USB-Serial-JTAG port enumerated while working on the device. A real
+# USB host attached to the board is detected automatically (a wall charger is
+# not), so this normally only matters for a bench supply with no data lines.
+# Unplugging the cable returns the board to its deep-sleep schedule.
+stay_awake = false

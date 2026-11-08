@@ -22,6 +22,11 @@ constexpr uint8_t kListenInterval = 5;
 
 EventGroupHandle_t g_events = nullptr;
 esp_netif_t* g_sta = nullptr;
+// The driver is initialized once. `g_started` is only the interface state, so
+// stop/start cycles are cheap - and, more importantly, legal: calling
+// esp_wifi_init() twice on the same driver aborts, which is what a bench build
+// that runs several fetch cycles without a deep sleep in between would do.
+bool g_initialized = false;
 bool g_started = false;
 bool g_got_ip = false;
 
@@ -60,9 +65,12 @@ extern "C" bool glass_wifi_start(uint32_t connect_timeout_ms) {
     if (g_events == nullptr) {
         g_events = xEventGroupCreate();
     }
-    if (!g_started) {
+    if (!g_initialized) {
         ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        const esp_err_t loop_err = esp_event_loop_create_default();
+        if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
+            ESP_ERROR_CHECK(loop_err);
+        }
         if (g_sta == nullptr) {
             g_sta = esp_netif_create_default_wifi_sta();
         }
@@ -82,6 +90,14 @@ extern "C" bool glass_wifi_start(uint32_t connect_timeout_ms) {
         wc.sta.listen_interval = kListenInterval;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        g_initialized = true;
+    }
+
+    // Between cycles the event bits are stale by design; the wait below must
+    // only see this attempt's connection.
+    xEventGroupClearBits(g_events, kConnectedBit | kFailedBit);
+    g_got_ip = false;
+    if (!g_started) {
         // Power save on: the board is asleep between fetches anyway, and this
         // is what keeps the radio from dominating the wake budget.
         ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
@@ -116,8 +132,9 @@ extern "C" bool glass_wifi_connected(void) { return g_got_ip; }
 
 extern "C" void glass_wifi_stop(void) {
     if (!g_started) return;
-    // Down but not out: esp_wifi_deinit() after a stop can leave the next
-    // start in a bad state on this SDK, and deep sleep resets everything.
+    // Down but not out: the driver stays initialized so a bench session can
+    // run another cycle without esp_wifi_init() aborting, and deep sleep
+    // resets everything anyway.
     esp_wifi_disconnect();
     esp_wifi_stop();
     g_got_ip = false;

@@ -69,4 +69,15 @@ menu "Weather Glass"
             Not so soon that a dead access point drains the cell in an
             afternoon.
 
+    config GLASS_STAY_AWAKE
+        bool "Stay awake and keep USB enumerated for debugging"
+        default n
+        help
+            Normally the USB-Serial-JTAG port disappears with the chip in deep
+            sleep, which is correct for a wall display but makes flashing and
+            monitoring a race against the wake window. With a USB host attached
+            the firmware already stays awake by itself; this forces the same
+            mode with no host, for a bench supply with the data lines unplugged.
+            Set in config.toml, not here.
+
 endmenu

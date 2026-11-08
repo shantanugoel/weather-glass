@@ -3,5 +3,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES glass_app glass_gfx zectrix_epd zectrix_board
              nvs_flash esp_wifi esp_netif esp_event esp_http_client esp-tls
-             esp_timer esp_driver_gpio esp_driver_i2c heap
+             esp_timer esp_driver_gpio esp_driver_i2c esp_driver_usb_serial_jtag
+             esp_stdio heap
 )

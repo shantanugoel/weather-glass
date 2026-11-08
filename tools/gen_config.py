@@ -50,7 +50,15 @@ SPEC = [
      _range(1, 1440)),
     (("schedule", "retry_interval_min"), "CONFIG_GLASS_RETRY_INTERVAL_MIN", int,
      _range(1, 1440)),
+    (("debug", "stay_awake"), "CONFIG_GLASS_STAY_AWAKE", bool, None),
 ]
+
+# Keys added after a config.toml was already in use. Their absence is not an
+# error - an existing install should keep building across a firmware update -
+# so these are the defaults used when the section or key is missing.
+OPTIONAL_DEFAULTS = {
+    ("debug", "stay_awake"): False,
+}
 
 
 PLACEHOLDERS = {"your-ssid", "your-password"}
@@ -77,13 +85,17 @@ def render(cfg: dict) -> tuple[str, list[str]]:
     problems: list[str] = []
     for toml_key, kconfig, kind, validate in SPEC:
         section, name = toml_key
-        if section not in cfg:
-            problems.append(f"[{section}] is missing")
+        if section not in cfg or name not in cfg[section]:
+            if toml_key in OPTIONAL_DEFAULTS:
+                value = OPTIONAL_DEFAULTS[toml_key]
+            else:
+                problems.append(f"[{section}] is missing or has no '{name}'")
+                continue
+        else:
+            value = cfg[section][name]
+        if kind is bool and not isinstance(value, bool):
+            problems.append(f"{section}.{name} must be true or false, got {value!r}")
             continue
-        if name not in cfg[section]:
-            problems.append(f"[{section}] has no '{name}'")
-            continue
-        value = cfg[section][name]
         if kind is int and not isinstance(value, int):
             problems.append(f"{section}.{name} must be an integer, got {value!r}")
             continue
@@ -101,7 +113,9 @@ def render(cfg: dict) -> tuple[str, list[str]]:
         if validate is not None and not validate(value):
             problems.append(f"{section}.{name} = {value!r} is out of range")
             continue
-        if kind is int:
+        if kind is bool:
+            lines.append(f"{kconfig}=y" if value else f"# {kconfig} is not set")
+        elif kind is int:
             lines.append(f"{kconfig}={value}")
         else:
             # Escape like a shell so a quote in a passphrase cannot break the

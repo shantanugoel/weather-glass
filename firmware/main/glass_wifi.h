@@ -1,7 +1,7 @@
 /**
  * WiFi station, just enough of it for one fetch.
  *
- * The panel is refreshed every 20 minutes by day and every 2 hours by night,
+ * The panel is refreshed every 30 minutes by day and every 2 hours by night,
  * and the radio is off in between, so this is a connect-once helper rather than
  * a resilient long-lived client: connect, or come back saying it could not.
  */
