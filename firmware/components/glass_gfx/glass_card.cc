@@ -28,7 +28,18 @@ namespace {
 constexpr uint8_t kInkDark = 12;
 constexpr uint8_t kInkLight = 246;
 constexpr uint8_t kRuleDark = 115;
-constexpr uint8_t kRuleLight = 205;
+
+/**
+ * Clear is the one condition whose "sunny" night variant is still a sun: the
+ * moon lives under the separate clear_night kind. Point every clear cell at it
+ * so a midnight frame is not drawn with a noon sun.
+ */
+const char* icon_for_time(const char* kind, bool day) {
+    if (!day && kind != nullptr && strcmp(kind, "sunny") == 0) {
+        return "clear_night";
+    }
+    return kind;
+}
 
 /**
  * Text with a one-pixel halo of the opposite ink. The sky behind the header
@@ -91,16 +102,19 @@ extern "C" void glass_card_render(glass_canvas_t* c, const glass_card_data_t* d,
     (void)style;
     (void)ws;
 
-    // One foreground for the whole frame, chosen by the plate rather than by
-    // the average tone under each label. Upstream uses near-black on day plates
-    // and near-white on night and thunder plates; sampling the background per
-    // panel is what put white type on a white slab.
-    const bool light_fg = !d->is_day || strcmp(d->icon, "thunder") == 0;
-    const uint8_t ink_big = light_fg ? kInkLight : kInkDark;
+    // The header sits on the open sky, so its ink follows the plate: near-black
+    // on a day sky, near-white on a night or storm sky.
+    const bool light_header = !d->is_day || strcmp(d->icon, "thunder") == 0;
+    const uint8_t ink_header = light_header ? kInkLight : kInkDark;
+    // Everything inside a glass pill is a different matter. The pills are
+    // frosted light slabs in every plate - including night and thunder - so the
+    // card content is always dark ink. Following the plate's foreground here is
+    // what put white type on a white slab at night: legible in a thumbnail, not
+    // on the wall.
+    const uint8_t ink_big = kInkDark;
     const uint8_t ink_metrics = ink_big;
-    const uint8_t ink_header = ink_big;
-    const uint8_t rule_big = light_fg ? kRuleLight : kRuleDark;
-    const uint8_t icon_ink = light_fg ? 246 : 20;
+    const uint8_t rule_big = kRuleDark;
+    const uint8_t icon_ink = 20;
 
     // Text centred on a point, as the reference lays it out. Centring is done
     // by measuring first and handing text_fit a left origin, so the width check
@@ -124,7 +138,8 @@ extern "C" void glass_card_render(glass_canvas_t* c, const glass_card_data_t* d,
     // The hero goes down first because its left edge bounds the text column:
     // laying text out first is how the daily range ended up printed on top of
     // the sun.
-    const glass_icon_variant_t* hero = glass_icon_find(d->icon, d->is_day, 96);
+    const glass_icon_variant_t* hero =
+        glass_icon_find(icon_for_time(d->icon, d->is_day), d->is_day, 96);
     // Reference geometry: the hero icon is pinned at (230,62) and the text
     // column stops short of it. That single constraint is what keeps the
     // temperature, the condition and the daily range off the artwork.
@@ -165,7 +180,7 @@ extern "C" void glass_card_render(glass_canvas_t* c, const glass_card_data_t* d,
     // UV reads as the sun by day and the moon at night; the baked kinds are
     // "sunny"/"clear_night" - there is no kind called "clear".
     const glass_icon_variant_t* uv_icon =
-        glass_icon_find(d->is_day ? "sunny" : "clear_night", d->is_day, 20);
+        glass_icon_find(icon_for_time("sunny", d->is_day), d->is_day, 20);
     gc_icon(c, wind_icon, 43, 187, icon_ink, 0);
     text_fit(c, &glass_font_f10b, 67, 192, 67 + 87, d->wind, ink_metrics, "wind", 'l');
     draw_rule(c, 158, 190, 204, rule_big);
@@ -183,7 +198,8 @@ extern "C" void glass_card_render(glass_canvas_t* c, const glass_card_data_t* d,
         const int x = 28 + i * 122;
         text_fit(c, &glass_font_f10b, x, 229, x + 100, day->label, ink_big,
                  "day label", 'l');
-        gc_icon(c, glass_icon_find(day->icon, day->is_day, 33), x - 1, 245, icon_ink, 0);
+        gc_icon(c, glass_icon_find(icon_for_time(day->icon, day->is_day), day->is_day, 33),
+                x - 1, 245, icon_ink, 0);
         char hilo[24];
         snprintf(hilo, sizeof(hilo), "%.7s / %.7s", day->high, day->low);
         text_fit(c, &glass_font_f12b, x + 39, 246, x + 39 + 77, hilo, ink_big,
