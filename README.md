@@ -119,9 +119,14 @@ q  reboot
 ```
 
 `[debug] stay_awake = true` in `config.toml` forces the same mode without a
-host, for a bench supply whose data lines are not connected. The OK-hold
-recovery loop above is still the way in when the firmware is too wedged to
-reach this path.
+host, for a bench supply whose data lines are not connected.
+
+A short press of OK or Down while asleep wakes the board and forces a panel
+refresh, even when the frame would otherwise be skipped as unchanged. While the
+board is awake in bench mode, any of the three buttons starts a cycle (Up can be
+used there even though it cannot wake the chip). Recovery is deliberately
+harder: hold OK through a RESET for a second and a half, and the power LED
+blinks. A button wake from deep sleep is an ordinary refresh, never recovery.
 
 `tools/flash_on_wake.sh` exists for the awkward case: it waits for the port to
 re-enumerate and starts `espflash` immediately, so a flash is not a race

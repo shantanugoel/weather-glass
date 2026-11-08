@@ -10,8 +10,6 @@
  * so the ESP is not keeping time itself, and the two front buttons share the
  * wake mask so a press re-draws immediately.
  */
-#include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -28,8 +26,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_sleep.h"
-#include "esp_stdio.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -615,6 +613,11 @@ void draw(zectrix_epd_handle_t epd, const weather_snapshot_t& snap,
  * on the board's input setup so the reading does not depend on call order.
  */
 bool button_held_at_boot(gpio_num_t pin) {
+    // Recovery is an explicit act, not something a button press during boot can
+    // stumble into. A deep-sleep wake caused by the button itself is an ordinary
+    // refresh; OK + RESET is the way in.
+    if (esp_reset_reason() == ESP_RST_DEEPSLEEP) return false;
+
     gpio_config_t io = {};
     io.pin_bit_mask = 1ULL << static_cast<int>(pin);
     io.mode = GPIO_MODE_INPUT;
@@ -623,7 +626,16 @@ bool button_held_at_boot(gpio_num_t pin) {
     io.intr_type = GPIO_INTR_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&io));
     vTaskDelay(pdMS_TO_TICKS(50));  // let the pull-up settle the pad
-    return gpio_get_level(pin) == 0;
+    if (gpio_get_level(pin) != 0) return false;
+
+    // A single sample made mashing the button for a refresh look exactly like a
+    // request for the console, and recovery never sleeps. Require a deliberate
+    // hold instead.
+    for (int i = 0; i < 15; ++i) {  // 1.5 s
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (gpio_get_level(pin) != 0) return false;
+    }
+    return true;
 }
 
 /**
@@ -634,7 +646,8 @@ bool button_held_at_boot(gpio_num_t pin) {
  * because recovery mode has to be able to ask for exactly what a wake does.
  */
 bool update_panel(zectrix_epd_handle_t epd, bool clock_from_rtc,
-                  weather_snapshot_t* snap, int64_t* now_utc_out) {
+                  weather_snapshot_t* snap, int64_t* now_utc_out,
+                  bool force_full = false) {
     
     bool fetched = false;
     if (glass_wifi_start(kWifiTimeoutMs)) {
@@ -684,7 +697,7 @@ bool update_panel(zectrix_epd_handle_t epd, bool clock_from_rtc,
     if (!fetched) {
         snprintf(card.status, sizeof(card.status), "offline");
     }
-    draw(epd, *snap, card, fetched ? nullptr : "offline");
+    draw(epd, *snap, card, fetched ? nullptr : "offline", force_full);
 
     const ZectrixPowerSnapshot power = g_board.ReadPowerSnapshot();
     if (power.battery_valid) {
@@ -696,27 +709,17 @@ bool update_panel(zectrix_epd_handle_t epd, bool clock_from_rtc,
 }
 
 /**
- * Console key polling.
+ * One console key, or -1.
  *
- * The USB-Serial-JTAG console is not fd 0 on this ESP-IDF port: stdin is the
- * newlib console path, while the USB device lives behind /dev/console. Worse,
- * select() on stdin returns immediately instead of waiting, which is why the
- * recovery commands were unreachable - the code looked right and never saw a
- * byte. Opening /dev/console explicitly and polling it non-blocking is what the
- * VFS actually supports here.
+ * The USB-Serial-JTAG console is not fd 0 here and its VFS does not implement
+ * select() as a wait, so neither read(0) nor select() ever sees a host byte.
+ * The driver's RX ring buffer does, and reading it directly avoids switching the
+ * VFS into driver mode: console logging must stay on the ROM TX path, which does
+ * not stall when the host briefly stops reading.
  */
-int open_console_poll() {
-    const int fd = open("/dev/console", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        ESP_LOGW(kTag, "console is not pollable (errno %d)", errno);
-    }
-    return fd;
-}
-
-int read_console_key(int fd) {
-    if (fd < 0) return -1;
-    char c = 0;
-    return read(fd, &c, 1) == 1 ? static_cast<unsigned char>(c) : -1;
+int read_console_key() {
+    uint8_t c = 0;
+    return usb_serial_jtag_read_bytes(&c, 1, 0) == 1 ? static_cast<int>(c) : -1;
 }
 
 /**
@@ -736,15 +739,15 @@ void recovery_loop(zectrix_epd_handle_t epd) {
     int64_t now_utc = 0;
     bool have = false;
     uint32_t beat = 0;
-    const int console_fd = open_console_poll();
     while (true) {
-        const int key = read_console_key(console_fd);
+        const int key = read_console_key();
         if (key >= 0) {
             const char c = static_cast<char>(key);
             ESP_LOGI(kTag, "recovery command '%c'", c);
             switch (c) {
                 case 'f':
-                    have = update_panel(epd, true, &snap, &now_utc);
+                    have = update_panel(epd, true, &snap, &now_utc,
+                                        /*force_full=*/true);
                     break;
                 case 'r':
                     if (have) {
@@ -839,21 +842,20 @@ bool bench_mode_requested() {
  * session deaf for half an hour. One-second ticks pace the wait and poll
  * /dev/console, so a keystroke is answered without powering the USB down.
  */
-void bench_wait(int64_t seconds) {
+bool bench_wait(int64_t seconds) {
     ESP_LOGI(kTag, "bench: staying enumerated; next cycle in %lld s "
                    "(f=now b=battery q=reboot)",
              static_cast<long long>(seconds));
-    // Poll /dev/console rather than select()ing stdin: see open_console_poll().
-    // The one-second tick is the clock; it is also what keeps an unsupported
-    // wait from turning this into a spin that burns the interval in milliseconds.
-    const int console_fd = open_console_poll();
+    // Poll the console RX ring buffer rather than select()ing stdin: see
+    // read_console_key(). The one-second tick is the clock; it also keeps a wait
+    // that cannot block from burning the interval in milliseconds.
     int64_t elapsed = 0;
     while (elapsed < seconds) {
-        if (!bench_mode_requested()) break;  // cable pulled: fall back to sleep
-        const int key = read_console_key(console_fd);
+        if (!bench_mode_requested()) return false;  // cable pulled
+        const int key = read_console_key();
         if (key == 'f') {
             ESP_LOGI(kTag, "bench: cycle requested");
-            break;
+            return true;
         }
         if (key == 'b') {
             const ZectrixPowerSnapshot p = g_board.ReadPowerSnapshot();
@@ -862,6 +864,13 @@ void bench_wait(int64_t seconds) {
         } else if (key == 'q') {
             esp_restart();
         }
+        // The board is awake, so Up can be heard here even though it cannot
+        // wake the chip from deep sleep.
+        ZectrixButtonEvent event;
+        if (g_board.WaitButton(&event, 0)) {
+            ESP_LOGI(kTag, "bench: button, drawing now");
+            return true;
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
         ++elapsed;
         if (elapsed % 300 == 0 && elapsed < seconds) {
@@ -869,7 +878,7 @@ void bench_wait(int64_t seconds) {
                      static_cast<long long>(seconds - elapsed));
         }
     }
-    if (console_fd >= 0) close(console_fd);
+    return false;
 }
 
 bool wake_was_button() {
@@ -930,11 +939,10 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(nvs);
 
-    // The USB console's VFS is registered at startup, but its I/O driver is
-    // installed only by esp_console_init(), which this app does not run. Without
-    // this call /dev/console reads the bare RX FIFO and never sees a host byte,
-    // so the bench and recovery single-key commands would be dead code.
-    ESP_ERROR_CHECK(esp_stdio_install_io_driver());
+    // RX only: the ring buffer is what makes bench/recovery keys real, while
+    // leaving TX on the ROM console. Deliberately no usb_serial_jtag_vfs_use_driver().
+    usb_serial_jtag_driver_config_t usj = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj));
 
     ESP_ERROR_CHECK(g_board.Init());
     g_board.SetPowerLed(false);
@@ -956,6 +964,7 @@ extern "C" void app_main(void) {
     // the system clock, which comes up at 1970.
     const bool clock_from_rtc = sync_clock_from_rtc();
     log_wake_detail();
+    const bool button_wake = wake_was_button();
 
     // Decided before the spurious-wake check: with a host attached, going back
     // to sleep is precisely what makes the port disappear under a monitor, so
@@ -1024,14 +1033,21 @@ extern "C" void app_main(void) {
     // driven into recovery is a board somebody is about to flash.
     if (button_held_at_boot(ZECTRIX_BUTTON_OK)) recovery_loop(epd);
 
+    // A button press is a request to see the glass now, so its first draw is
+    // forced: the frame-skip optimisation is for scheduled wakes, not for a
+    // person standing in front of the panel. Without this a press fetched and
+    // rendered but then skipped the refresh, which looks like a dead button.
+    bool force_next = button_wake;
     for (;;) {
         weather_snapshot_t snap = {};
         int64_t now_utc = 0;
-        const bool fetched = update_panel(epd, clock_from_rtc, &snap, &now_utc);
+        const bool fetched =
+            update_panel(epd, clock_from_rtc, &snap, &now_utc, force_next);
+        force_next = false;
         const int64_t delay = plan_next_delay(fetched, snap, now_utc);
 
         if (bench) {
-            bench_wait(delay);
+            force_next = bench_wait(delay);
             if (bench_mode_requested()) continue;
             ESP_LOGW(kTag, "USB host gone; resuming the deep-sleep schedule");
             bench = false;
